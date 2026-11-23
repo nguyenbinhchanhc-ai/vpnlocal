@@ -19,17 +19,23 @@ public final class PacketTunnelProvider: NEPacketTunnelProvider {
     private var stats = TunnelStats()
     private var recentLogs: [QueryLogEntry] = []
     private var isRunning = false
+    private var initialSettingsApplied = false
     private var activeMTU = 1420
-    private var activePathLabel = "Detecting"
     private var persistTimer: DispatchSourceTimer?
 
     public override func startTunnel(options: [String: NSObject]?, completionHandler: @escaping (Error?) -> Void) {
         let loadedConfig = store.loadConfig()
         stateLock.lock()
         self.config = loadedConfig
-        self.stats = TunnelStats(startedAt: Date())
+        self.stats = TunnelStats(
+            activeMTU: loadedConfig.wifiMTU,
+            networkPathDescription: "TUN Active",
+            startedAt: Date()
+        )
         self.recentLogs = store.loadQueryLogs()
         self.isRunning = true
+        self.initialSettingsApplied = false
+        self.activeMTU = loadedConfig.wifiMTU
         stateLock.unlock()
 
         filterEngine.update(config: loadedConfig)
@@ -51,6 +57,9 @@ public final class PacketTunnelProvider: NEPacketTunnelProvider {
                 completionHandler(error)
                 return
             }
+            self?.stateLock.lock()
+            self?.initialSettingsApplied = true
+            self?.stateLock.unlock()
             completionHandler(nil)
             self?.readPacketsLoop()
         }
@@ -59,6 +68,7 @@ public final class PacketTunnelProvider: NEPacketTunnelProvider {
     public override func stopTunnel(with reason: NEProviderStopReason, completionHandler: @escaping () -> Void) {
         stateLock.lock()
         isRunning = false
+        initialSettingsApplied = false
         stateLock.unlock()
 
         persistTimer?.cancel()
@@ -72,8 +82,17 @@ public final class PacketTunnelProvider: NEPacketTunnelProvider {
     }
 
     public override func handleAppMessage(_ messageData: Data, completionHandler: ((Data?) -> Void)?) {
-        guard let cmdRaw = String(data: messageData, encoding: .utf8),
-              let cmd = AppGroupConstants.IPCCommand(rawValue: cmdRaw) else {
+        let envelope = try? JSONDecoder().decode(IPCEnvelope.self, from: messageData)
+        let cmd: AppGroupConstants.IPCCommand?
+        if let envelope {
+            cmd = envelope.command
+        } else if let cmdRaw = String(data: messageData, encoding: .utf8) {
+            cmd = AppGroupConstants.IPCCommand(rawValue: cmdRaw)
+        } else {
+            cmd = nil
+        }
+
+        guard let cmd else {
             completionHandler?(nil)
             return
         }
@@ -84,17 +103,29 @@ public final class PacketTunnelProvider: NEPacketTunnelProvider {
             stateLock.lock()
             let currentStats = stats
             stateLock.unlock()
-            let encoded = try? JSONEncoder().encode(currentStats)
-            completionHandler?(encoded)
+            completionHandler?(try? JSONEncoder().encode(currentStats))
+
+        case .getFullTelemetry:
+            flushTelemetryNow()
+            stateLock.lock()
+            let snapshot = TelemetrySnapshot(
+                stats: stats,
+                logs: recentLogs,
+                resolverMetrics: upstreamRacer.currentMetricsSnapshot()
+            )
+            stateLock.unlock()
+            completionHandler?(try? JSONEncoder().encode(snapshot))
+
+        case .pushConfig:
+            let updated = envelope?.config ?? store.loadConfig()
+            store.saveConfig(updated)
+            applyUpdatedConfig(updated) {
+                completionHandler?(Data("OK".utf8))
+            }
 
         case .reloadConfig:
             let updated = store.loadConfig()
-            stateLock.lock()
-            self.config = updated
-            stateLock.unlock()
-            filterEngine.update(config: updated)
-            upstreamRacer.updateResolvers(updated.resolvers)
-            applyTunnelNetworkSettings(config: updated, mtu: activeMTU) { _ in
+            applyUpdatedConfig(updated) {
                 completionHandler?(Data("OK".utf8))
             }
 
@@ -108,6 +139,19 @@ public final class PacketTunnelProvider: NEPacketTunnelProvider {
             stateLock.unlock()
             store.saveQueryLogs([])
             completionHandler?(Data("CLEARED".utf8))
+        }
+    }
+
+    private func applyUpdatedConfig(_ updated: OptimizationConfig, completion: @escaping () -> Void) {
+        stateLock.lock()
+        self.config = updated
+        let mtu = self.activeMTU
+        stateLock.unlock()
+
+        filterEngine.update(config: updated)
+        upstreamRacer.updateResolvers(updated.resolvers)
+        applyTunnelNetworkSettings(config: updated, mtu: mtu) { _ in
+            completion()
         }
     }
 
@@ -131,18 +175,20 @@ public final class PacketTunnelProvider: NEPacketTunnelProvider {
                 label = "Wi-Fi"
             } else {
                 targetMTU = currentConfig.wifiMTU
-                label = path.status == .satisfied ? "Connected" : "Reconnecting"
+                label = path.status == .satisfied ? "TUN Active" : "Reconnecting"
             }
 
             self.stateLock.lock()
             let mtuChanged = self.activeMTU != targetMTU
-            self.activeMTU = targetMTU
-            self.activePathLabel = label
-            self.stats.activeMTU = targetMTU
+            let readyForReapply = self.initialSettingsApplied && self.isRunning
+            if readyForReapply && mtuChanged {
+                self.activeMTU = targetMTU
+            }
+            self.stats.activeMTU = self.activeMTU
             self.stats.networkPathDescription = label
             self.stateLock.unlock()
 
-            if mtuChanged && self.tunnelRunning() {
+            if readyForReapply && mtuChanged {
                 self.applyTunnelNetworkSettings(config: currentConfig, mtu: targetMTU) { _ in }
             }
         }
@@ -159,42 +205,41 @@ public final class PacketTunnelProvider: NEPacketTunnelProvider {
         let settings = NEPacketTunnelNetworkSettings(tunnelRemoteAddress: AppGroupConstants.tunnelGatewayAddress)
         settings.mtu = NSNumber(value: max(1280, min(1500, mtu)))
 
+        // IPv4 virtual interface + split-tunnel routes for local DNS (10.11.0.1) and optional UDP CIDRs
         let ipv4 = NEIPv4Settings(
             addresses: [AppGroupConstants.tunnelVirtualAddress],
             subnetMasks: [AppGroupConstants.tunnelSubnetMask]
         )
 
-        var included: [NEIPv4Route] = [
+        var includedIPv4: [NEIPv4Route] = [
+            NEIPv4Route(destinationAddress: AppGroupConstants.tunnelDNSServer, subnetMask: "255.255.255.255"),
             NEIPv4Route(destinationAddress: "10.11.0.0", subnetMask: "255.255.255.0")
         ]
         if config.enableUDPRelayRoutes {
             for rule in config.customRoutes where rule.isEnabled {
                 if let parsed = rule.parsedNetwork {
-                    included.append(NEIPv4Route(destinationAddress: parsed.address, subnetMask: parsed.subnetMask))
+                    includedIPv4.append(NEIPv4Route(destinationAddress: parsed.address, subnetMask: parsed.subnetMask))
                 }
             }
         }
-        ipv4.includedRoutes = included
-
-        var excluded: [NEIPv4Route] = [
-            NEIPv4Route(destinationAddress: "192.168.0.0", subnetMask: "255.255.0.0"),
-            NEIPv4Route(destinationAddress: "172.16.0.0", subnetMask: "255.240.0.0"),
-            NEIPv4Route(destinationAddress: "127.0.0.0", subnetMask: "255.0.0.0"),
-            NEIPv4Route(destinationAddress: "224.0.0.0", subnetMask: "240.0.0.0")
-        ]
-        // Exclude upstream resolver IPs so extension queries never loop into the tunnel
-        for resolver in config.resolvers where !resolver.address.isEmpty {
-            excluded.append(NEIPv4Route(destinationAddress: resolver.address, subnetMask: "255.255.255.255"))
-        }
-        ipv4.excludedRoutes = excluded
+        ipv4.includedRoutes = includedIPv4
         settings.ipv4Settings = ipv4
+
+        // IPv6 virtual interface so dual-stack iOS mDNSResponder queries hitting fd11:0:0:1::1 are also captured
+        let ipv6 = NEIPv6Settings(
+            addresses: [AppGroupConstants.tunnelVirtualIPv6Address],
+            networkPrefixLengths: [64]
+        )
+        ipv6.includedRoutes = [
+            NEIPv6Route(destinationAddress: AppGroupConstants.tunnelDNSIPv6Server, networkPrefixLength: 128)
+        ]
+        settings.ipv6Settings = ipv6
 
         let dnsSettings = NEDNSSettings(servers: [
             AppGroupConstants.tunnelDNSServer,
-            AppGroupConstants.tunnelSecondaryDNSServer
+            AppGroupConstants.tunnelDNSIPv6Server
         ])
         dnsSettings.matchDomains = [""]
-        dnsSettings.matchDomainsNoSearch = true
         settings.dnsSettings = dnsSettings
 
         setTunnelNetworkSettings(settings, completionHandler: completion)
@@ -214,18 +259,28 @@ public final class PacketTunnelProvider: NEPacketTunnelProvider {
     }
 
     private func processIncomingBatch(packets: [Data], protocols: [NSNumber]) {
-        var parsedPackets: [IPv4Packet] = []
-        parsedPackets.reserveCapacity(packets.count)
+        var parsedIPv4: [IPv4Packet] = []
+        parsedIPv4.reserveCapacity(packets.count)
 
         for (index, raw) in packets.enumerated() {
             let protoFamily = index < protocols.count ? protocols[index].int32Value : AF_INET
-            guard protoFamily == AF_INET, let ipv4 = IPv4Packet(data: raw) else { continue }
-            parsedPackets.append(ipv4)
+            if protoFamily == AF_INET6 {
+                if let ipv6UDP = IPv6UDPPacket(data: raw), ipv6UDP.destinationPort == 53 {
+                    stateLock.lock()
+                    stats.packetsScheduledP0 += 1
+                    stateLock.unlock()
+                    handleIPv6DNSQuery(packet: ipv6UDP, config: currentConfig())
+                }
+                continue
+            }
+            if protoFamily == AF_INET, let ipv4 = IPv4Packet(data: raw) {
+                parsedIPv4.append(ipv4)
+            }
         }
 
-        guard !parsedPackets.isEmpty else { return }
+        guard !parsedIPv4.isEmpty else { return }
 
-        let counts = scheduler.enqueueBatch(parsedPackets)
+        let counts = scheduler.enqueueBatch(parsedIPv4)
         let currentCfg = currentConfig()
 
         stateLock.lock()
@@ -255,7 +310,18 @@ public final class PacketTunnelProvider: NEPacketTunnelProvider {
         guard let udp = packet.udpSegment else { return }
 
         if udp.destinationPort == 53 {
-            handleDNSQuery(packet: packet, udp: udp, config: config)
+            handleDNSPayload(udp.payload, config: config) { [weak self] replyData in
+                guard let self else { return }
+                let ipReply = IPv4Packet.buildUDPReply(
+                    sourceIP: packet.destinationIP,
+                    sourcePort: udp.destinationPort,
+                    destinationIP: packet.sourceIP,
+                    destinationPort: udp.sourcePort,
+                    udpPayload: replyData,
+                    dscp: 46
+                )
+                self.writeTunnelPackets([ipReply], protocols: [NSNumber(value: AF_INET)])
+            }
             return
         }
 
@@ -264,21 +330,38 @@ public final class PacketTunnelProvider: NEPacketTunnelProvider {
         }
     }
 
+    private func handleIPv6DNSQuery(packet: IPv6UDPPacket, config: OptimizationConfig) {
+        handleDNSPayload(packet.udpPayload, config: config) { [weak self] replyData in
+            guard let self else { return }
+            let ip6Reply = IPv6UDPPacket.buildUDPReply(
+                sourceAddress: packet.destinationAddress,
+                sourcePort: packet.destinationPort,
+                destinationAddress: packet.sourceAddress,
+                destinationPort: packet.sourcePort,
+                udpPayload: replyData
+            )
+            self.writeTunnelPackets([ip6Reply], protocols: [NSNumber(value: AF_INET6)])
+        }
+    }
+
     // MARK: - On-Device DNS Query Optimizer
 
-    private func handleDNSQuery(packet: IPv4Packet, udp: UDPSegment, config: OptimizationConfig) {
+    private func handleDNSPayload(
+        _ payload: Data,
+        config: OptimizationConfig,
+        replySender: @escaping @Sendable (Data) -> Void
+    ) {
         let startTime = DispatchTime.now()
-        guard let question = DNSWireParser.parseQuestion(from: udp.payload) else { return }
+        guard let question = DNSWireParser.parseQuestion(from: payload) else { return }
 
-        // 1. Background Noise & Telemetry Shield
         if filterEngine.shouldBlock(domain: question.domain) {
             let synth = DNSWireParser.buildSyntheticResponse(
-                for: udp.payload,
+                for: payload,
                 question: question,
-                rcode: 3, // NXDOMAIN
+                rcode: 3,
                 zeroAddressAnswer: false
             )
-            sendDNSReply(synth, originalPacket: packet, originalUDP: udp)
+            replySender(synth)
             recordDNSLog(
                 domain: question.domain,
                 recordType: question.recordTypeLabel,
@@ -289,15 +372,14 @@ public final class PacketTunnelProvider: NEPacketTunnelProvider {
             return
         }
 
-        // 2. Optional IPv6 AAAA Suppression (prevents slow Happy-Eyeballs fallback when IPv6 path lags)
         if config.suppressIPv6AAAA && question.qtype == DNSRecordType.aaaa.rawValue {
             let emptyNoError = DNSWireParser.buildSyntheticResponse(
-                for: udp.payload,
+                for: payload,
                 question: question,
                 rcode: 0,
                 zeroAddressAnswer: false
             )
-            sendDNSReply(emptyNoError, originalPacket: packet, originalUDP: udp)
+            replySender(emptyNoError)
             recordDNSLog(
                 domain: question.domain,
                 recordType: question.recordTypeLabel,
@@ -317,7 +399,7 @@ public final class PacketTunnelProvider: NEPacketTunnelProvider {
 
         switch lookup {
         case let .freshHit(response, shouldPrefetch, upstreamName):
-            sendDNSReply(response, originalPacket: packet, originalUDP: udp)
+            replySender(response)
             recordDNSLog(
                 domain: question.domain,
                 recordType: question.recordTypeLabel,
@@ -326,11 +408,11 @@ public final class PacketTunnelProvider: NEPacketTunnelProvider {
                 upstream: "RAM (\(upstreamName))"
             )
             if shouldPrefetch {
-                revalidateInBackground(queryPayload: udp.payload, key: cacheKey, config: config)
+                revalidateInBackground(queryPayload: payload, key: cacheKey, config: config)
             }
 
         case let .staleHit(response, upstreamName):
-            sendDNSReply(response, originalPacket: packet, originalUDP: udp)
+            replySender(response)
             recordDNSLog(
                 domain: question.domain,
                 recordType: question.recordTypeLabel,
@@ -338,18 +420,18 @@ public final class PacketTunnelProvider: NEPacketTunnelProvider {
                 latencyMs: elapsedMs(since: startTime),
                 upstream: "SWR (\(upstreamName))"
             )
-            revalidateInBackground(queryPayload: udp.payload, key: cacheKey, config: config)
+            revalidateInBackground(queryPayload: payload, key: cacheKey, config: config)
 
         case .miss:
             upstreamRacer.resolve(
-                queryData: udp.payload,
+                queryData: payload,
                 enableHedgedRacing: config.enableHedgedRacing,
                 hedgeDelayMs: config.hedgeDelayMs
             ) { [weak self] resolution in
                 guard let self else { return }
                 if let resolution {
                     let rewritten = DNSWireParser.rewriteTransactionID(in: resolution.responseData, to: question.transactionID)
-                    self.sendDNSReply(rewritten, originalPacket: packet, originalUDP: udp)
+                    replySender(rewritten)
 
                     let ttl = DNSWireParser.extractMinTTL(from: rewritten, fallbackTTL: config.minCacheTTLSeconds)
                     self.dnsCache.insert(
@@ -371,11 +453,11 @@ public final class PacketTunnelProvider: NEPacketTunnelProvider {
                     )
                 } else {
                     let servFail = DNSWireParser.buildSyntheticResponse(
-                        for: udp.payload,
+                        for: payload,
                         question: question,
                         rcode: 2
                     )
-                    self.sendDNSReply(servFail, originalPacket: packet, originalUDP: udp)
+                    replySender(servFail)
                     self.recordDNSLog(
                         domain: question.domain,
                         recordType: question.recordTypeLabel,
@@ -405,19 +487,6 @@ public final class PacketTunnelProvider: NEPacketTunnelProvider {
                 upstreamName: resolution.resolverName
             )
         }
-    }
-
-    private func sendDNSReply(_ dnsPayload: Data, originalPacket: IPv4Packet, originalUDP: UDPSegment) {
-        guard !dnsPayload.isEmpty else { return }
-        let ipReply = IPv4Packet.buildUDPReply(
-            sourceIP: originalPacket.destinationIP,
-            sourcePort: originalUDP.destinationPort,
-            destinationIP: originalPacket.sourceIP,
-            destinationPort: originalUDP.sourcePort,
-            udpPayload: dnsPayload,
-            dscp: 46
-        )
-        writeTunnelPackets([ipReply], protocols: [NSNumber(value: AF_INET)])
     }
 
     private func writeTunnelPackets(_ packets: [Data], protocols: [NSNumber]) {

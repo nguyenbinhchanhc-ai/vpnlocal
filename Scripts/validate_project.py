@@ -35,6 +35,7 @@ def check_required_files():
         "Shared/SharedStore.swift",
         "PingPulseTunnel/PacketTunnelProvider.swift",
         "PingPulseTunnel/Network/IPv4Packet.swift",
+        "PingPulseTunnel/Network/IPv6DNSPacket.swift",
         "PingPulseTunnel/Network/UpstreamRacer.swift",
         "PingPulseTunnel/Network/UDPRelayEngine.swift",
         "PingPulseTunnel/Engine/PacketScheduler.swift",

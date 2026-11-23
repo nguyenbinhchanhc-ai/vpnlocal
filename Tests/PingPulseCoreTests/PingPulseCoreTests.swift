@@ -164,6 +164,45 @@ final class PingPulseCoreTests: XCTestCase {
         XCTAssertEqual(parsed?.subnetMask, "255.255.255.0")
     }
 
+    func testIPv6UDPPacketBuildAndParse() {
+        var srcAddr = Data(count: 16)
+        srcAddr[0] = 0xFD; srcAddr[1] = 0x11; srcAddr[15] = 0x01
+        var dstAddr = Data(count: 16)
+        dstAddr[0] = 0xFD; dstAddr[1] = 0x11; dstAddr[15] = 0x02
+
+        let dnsPayload = Data([0xAB, 0xCD, 0x81, 0x80, 0x00, 0x01, 0x00, 0x00])
+        let built = IPv6UDPPacket.buildUDPReply(
+            sourceAddress: srcAddr,
+            sourcePort: 53,
+            destinationAddress: dstAddr,
+            destinationPort: 55000,
+            udpPayload: dnsPayload
+        )
+        let parsed = IPv6UDPPacket(data: built)
+        XCTAssertNotNil(parsed)
+        XCTAssertEqual(parsed?.sourcePort, 53)
+        XCTAssertEqual(parsed?.destinationPort, 55000)
+        XCTAssertEqual(parsed?.udpPayload, dnsPayload)
+    }
+
+    func testIPCEnvelopeAndTelemetrySnapshotCodable() throws {
+        let env = IPCEnvelope(command: .pushConfig, config: .defaultConfig)
+        let encoded = try JSONEncoder().encode(env)
+        let decoded = try JSONDecoder().decode(IPCEnvelope.self, from: encoded)
+        XCTAssertEqual(decoded.command, .pushConfig)
+        XCTAssertEqual(decoded.config?.profile, .gamingShield)
+
+        let snap = TelemetrySnapshot(
+            stats: TunnelStats(totalQueries: 12, cacheHits: 9, networkPathDescription: "Wi-Fi"),
+            logs: [QueryLogEntry(domain: "one.one.one.one", recordType: "A", outcome: .cacheHit, latencyMs: 0.4, upstreamUsed: "RAM")],
+            resolverMetrics: []
+        )
+        let snapData = try JSONEncoder().encode(snap)
+        let snapDecoded = try JSONDecoder().decode(TelemetrySnapshot.self, from: snapData)
+        XCTAssertEqual(snapDecoded.stats.networkPathDescription, "Wi-Fi")
+        XCTAssertEqual(snapDecoded.logs.count, 1)
+    }
+
     private func makeDNSQuery(txID: UInt16, domain: String, qtype: UInt16) -> Data {
         var data = Data()
         data.append(UInt8((txID >> 8) & 0xFF))

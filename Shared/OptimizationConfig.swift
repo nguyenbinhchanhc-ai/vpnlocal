@@ -191,7 +191,7 @@ public struct OptimizationConfig: Codable, Equatable, Sendable {
         enableQoSPacing: true,
         maxBurstBytesPerTick: 32768,
         enableUDPRelayRoutes: false,
-        onDemandAutoConnect: true,
+        onDemandAutoConnect: false,
         resolvers: UpstreamResolver.defaults,
         customRoutes: [
             CustomRouteRule(label: "Game Relay Sample (Disabled)", cidr: "103.28.54.0/24", isEnabled: false)

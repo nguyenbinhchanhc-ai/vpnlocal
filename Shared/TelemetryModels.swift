@@ -152,3 +152,30 @@ public struct LatencySample: Identifiable, Equatable, Sendable {
     public let rttMs: Double
     public let isLoss: Bool
 }
+
+public struct TelemetrySnapshot: Codable, Equatable, Sendable {
+    public var stats: TunnelStats
+    public var logs: [QueryLogEntry]
+    public var resolverMetrics: [ResolverHealthMetric]
+
+    public init(
+        stats: TunnelStats,
+        logs: [QueryLogEntry],
+        resolverMetrics: [ResolverHealthMetric]
+    ) {
+        self.stats = stats
+        self.logs = logs
+        self.resolverMetrics = resolverMetrics
+    }
+}
+
+public struct IPCEnvelope: Codable, Sendable {
+    public let command: AppGroupConstants.IPCCommand
+    public let config: OptimizationConfig?
+
+    public init(command: AppGroupConstants.IPCCommand, config: OptimizationConfig? = nil) {
+        self.command = command
+        self.config = config
+    }
+}
+

@@ -1,5 +1,6 @@
 import Combine
 import Foundation
+import Network
 import NetworkExtension
 
 @MainActor
@@ -54,8 +55,10 @@ public final class VPNManager: ObservableObject {
 
     public func toggleVPN() {
         lastErrorMessage = nil
-        if isConnectedOrConnecting {
-            manager?.connection.stopVPNTunnel()
+        if isConnectedOrConnecting || status == .disconnecting {
+            Task {
+                await stopVPN()
+            }
         } else {
             Task {
                 await startVPN()
@@ -66,7 +69,7 @@ public final class VPNManager: ObservableObject {
     public func applyConfig(_ newConfig: OptimizationConfig) {
         config = newConfig
         store.saveConfig(newConfig)
-        sendIPC(.reloadConfig)
+        sendIPCEnvelope(IPCEnvelope(command: .pushConfig, config: newConfig))
         Task {
             await syncOnDemandRules()
         }
@@ -79,23 +82,43 @@ public final class VPNManager: ObservableObject {
     }
 
     public func flushDNSCache() {
-        sendIPC(.flushCache)
+        sendIPCEnvelope(IPCEnvelope(command: .flushCache))
     }
 
     public func clearLogs() {
         queryLogs = []
         store.saveQueryLogs([])
-        sendIPC(.clearLogs)
+        sendIPCEnvelope(IPCEnvelope(command: .clearLogs))
     }
 
     public func refreshFromStore() {
-        queryLogs = store.loadQueryLogs()
-        resolverMetrics = store.loadResolverMetrics()
-        if status == .connected {
-            sendIPC(.getLiveStats)
+        if status == .connected || status == .reasserting {
+            sendIPCEnvelope(IPCEnvelope(command: .getFullTelemetry))
         } else {
             stats = store.loadStats()
+            queryLogs = store.loadQueryLogs()
+            resolverMetrics = store.loadResolverMetrics()
         }
+    }
+
+    /// Triggers a live HTTPS/DNS lookup through iOS networking to immediately exercise
+    /// the local tunnel DNS optimizer and verify query capture.
+    public func runDNSTestQuery() {
+        lastErrorMessage = nil
+        let conn = NWConnection(host: "one.one.one.one", port: .https, using: .tcp)
+        conn.stateUpdateHandler = { [weak self] state in
+            switch state {
+            case .ready, .failed, .cancelled:
+                conn.cancel()
+                Task { @MainActor [weak self] in
+                    try? await Task.sleep(nanoseconds: 350_000_000)
+                    self?.refreshFromStore()
+                }
+            default:
+                break
+            }
+        }
+        conn.start(queue: .global(qos: .userInitiated))
     }
 
     // MARK: - NETunnelProviderManager Lifecycle
@@ -103,14 +126,17 @@ public final class VPNManager: ObservableObject {
     private func loadOrCreateManager() async {
         do {
             let managers = try await NETunnelProviderManager.loadAllFromPreferences()
-            if let existing = managers.first(where: {
-                ($0.protocolConfiguration as? NETunnelProviderProtocol)?.providerBundleIdentifier == AppGroupConstants.tunnelBundleIdentifier
+            let targetBundleID = AppGroupConstants.resolvedTunnelBundleIdentifier
+            if let existing = managers.first(where: { mgr in
+                let protoID = (mgr.protocolConfiguration as? NETunnelProviderProtocol)?.providerBundleIdentifier
+                return protoID == targetBundleID || protoID == AppGroupConstants.tunnelBundleIdentifier || (protoID?.hasSuffix(".tunnel") == true)
             }) {
                 self.manager = existing
                 self.status = existing.connection.status
+                self.refreshFromStore()
             } else {
                 let created = NETunnelProviderManager()
-                configureProtocol(on: created)
+                configureProtocol(on: created, allowOnDemand: config.onDemandAutoConnect)
                 try await created.saveToPreferences()
                 try await created.loadFromPreferences()
                 self.manager = created
@@ -127,7 +153,7 @@ public final class VPNManager: ObservableObject {
                 await loadOrCreateManager()
             }
             guard let mgr = manager else { return }
-            configureProtocol(on: mgr)
+            configureProtocol(on: mgr, allowOnDemand: config.onDemandAutoConnect)
             try await mgr.saveToPreferences()
             try await mgr.loadFromPreferences()
             try mgr.connection.startVPNTunnel()
@@ -136,9 +162,25 @@ public final class VPNManager: ObservableObject {
         }
     }
 
+    /// Disables On-Demand BEFORE stopping the tunnel so iOS nesessionmanager does not
+    /// immediately restart the VPN when the user turns it off.
+    private func stopVPN() async {
+        guard let mgr = manager else { return }
+        do {
+            mgr.isOnDemandEnabled = false
+            mgr.onDemandRules = []
+            try await mgr.saveToPreferences()
+            try await mgr.loadFromPreferences()
+        } catch {
+            self.lastErrorMessage = "Stop warning: \(error.localizedDescription)"
+        }
+        mgr.connection.stopVPNTunnel()
+    }
+
     private func syncOnDemandRules() async {
         guard let mgr = manager else { return }
-        configureProtocol(on: mgr)
+        let shouldEnableOnDemand = isConnectedOrConnecting && config.onDemandAutoConnect
+        configureProtocol(on: mgr, allowOnDemand: shouldEnableOnDemand)
         do {
             try await mgr.saveToPreferences()
             try await mgr.loadFromPreferences()
@@ -147,15 +189,15 @@ public final class VPNManager: ObservableObject {
         }
     }
 
-    private func configureProtocol(on mgr: NETunnelProviderManager) {
+    private func configureProtocol(on mgr: NETunnelProviderManager, allowOnDemand: Bool) {
         let proto = NETunnelProviderProtocol()
-        proto.providerBundleIdentifier = AppGroupConstants.tunnelBundleIdentifier
+        proto.providerBundleIdentifier = AppGroupConstants.resolvedTunnelBundleIdentifier
         proto.serverAddress = "PingPulse Local Engine (10.11.0.1)"
         mgr.protocolConfiguration = proto
         mgr.localizedDescription = "PingPulse Local Anti-Ping VPN"
         mgr.isEnabled = true
 
-        if config.onDemandAutoConnect {
+        if allowOnDemand {
             let connectRule = NEOnDemandRuleConnect()
             connectRule.interfaceTypeMatch = .any
             mgr.onDemandRules = [connectRule]
@@ -182,31 +224,46 @@ public final class VPNManager: ObservableObject {
     }
 
     private func startPolling() {
-        pollTimer = Timer.scheduledTimer(withTimeInterval: 2.0, repeats: true) { [weak self] _ in
+        pollTimer = Timer.scheduledTimer(withTimeInterval: 1.5, repeats: true) { [weak self] _ in
             Task { @MainActor in
                 self?.refreshFromStore()
             }
         }
     }
 
-    private func sendIPC(_ command: AppGroupConstants.IPCCommand) {
+    private func sendIPCEnvelope(_ envelope: IPCEnvelope) {
         guard let session = manager?.connection as? NETunnelProviderSession,
               status == .connected || status == .reasserting else {
             return
         }
-        let payload = Data(command.rawValue.utf8)
+        guard let payload = try? JSONEncoder().encode(envelope) else { return }
         do {
             try session.sendProviderMessage(payload) { [weak self] responseData in
-                guard let self, command == .getLiveStats, let responseData,
-                      let decoded = try? JSONDecoder().decode(TunnelStats.self, from: responseData) else {
-                    return
-                }
+                guard let self else { return }
                 Task { @MainActor in
-                    self.stats = decoded
+                    guard let responseData else {
+                        if envelope.command == .getFullTelemetry {
+                            // Fall back to App Group store if provider returned nil
+                            self.stats = self.store.loadStats()
+                            self.queryLogs = self.store.loadQueryLogs()
+                            self.resolverMetrics = self.store.loadResolverMetrics()
+                        }
+                        return
+                    }
+
+                    if envelope.command == .getFullTelemetry,
+                       let snapshot = try? JSONDecoder().decode(TelemetrySnapshot.self, from: responseData) {
+                        self.stats = snapshot.stats
+                        self.queryLogs = snapshot.logs
+                        self.resolverMetrics = snapshot.resolverMetrics
+                    } else if envelope.command == .getLiveStats,
+                              let decoded = try? JSONDecoder().decode(TunnelStats.self, from: responseData) {
+                        self.stats = decoded
+                    }
                 }
             }
         } catch {
-            // Extension may still be transitioning state
+            self.lastErrorMessage = "Extension IPC error: \(error.localizedDescription)"
         }
     }
 }

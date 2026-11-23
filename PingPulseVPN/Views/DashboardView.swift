@@ -150,6 +150,13 @@ struct DashboardView: View {
                 Text("Real-Time Ping Trajectory")
                     .font(.subheadline.weight(.semibold))
                 Spacer()
+                Button("Test DNS") {
+                    vpnManager.runDNSTestQuery()
+                }
+                .font(.caption.weight(.semibold))
+                .foregroundColor(accentEmerald)
+                .padding(.trailing, 8)
+
                 Button("Probe") {
                     latencyMonitor.runSingleProbe()
                 }
