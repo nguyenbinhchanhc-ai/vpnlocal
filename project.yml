@@ -1,0 +1,107 @@
+name: PingPulseVPN
+options:
+  bundleIdPrefix: com.nguyenbinhchanh
+  deploymentTarget:
+    iOS: "16.0"
+  xcodeVersion: "15.4"
+  createIntermediateGroups: true
+  defaultConfig: Release
+
+settings:
+  base:
+    SWIFT_VERSION: "5.9"
+    IPHONEOS_DEPLOYMENT_TARGET: "16.0"
+    TARGETED_DEVICE_FAMILY: "1,2"
+    ENABLE_BITCODE: NO
+    DEAD_CODE_STRIPPING: YES
+
+schemes:
+  PingPulseVPN:
+    build:
+      targets:
+        PingPulseVPN: all
+        PingPulseTunnel: all
+    run:
+      config: Debug
+    test:
+      config: Debug
+      targets:
+        - PingPulseCoreTests
+    archive:
+      config: Release
+
+  PingPulseCoreTests:
+    build:
+      targets:
+        PingPulseCoreTests: [test]
+    test:
+      config: Debug
+      targets:
+        - PingPulseCoreTests
+
+targets:
+  PingPulseVPN:
+    type: application
+    platform: iOS
+    sources:
+      - path: PingPulseVPN
+        excludes:
+          - "Resources/Info.plist"
+          - "Resources/PingPulseVPN.entitlements"
+      - path: Shared
+    resources:
+      - path: PingPulseVPN/Resources/Assets.xcassets
+    settings:
+      base:
+        PRODUCT_NAME: PingPulseVPN
+        PRODUCT_BUNDLE_IDENTIFIER: com.nguyenbinhchanh.pingpulse
+        INFOPLIST_FILE: PingPulseVPN/Resources/Info.plist
+        CODE_SIGN_ENTITLEMENTS: PingPulseVPN/Resources/PingPulseVPN.entitlements
+        ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
+        MARKETING_VERSION: "1.0.0"
+        CURRENT_PROJECT_VERSION: "1"
+    dependencies:
+      - target: PingPulseTunnel
+        embed: true
+        codeSign: false
+      - sdk: NetworkExtension.framework
+      - sdk: Network.framework
+
+  PingPulseTunnel:
+    type: app-extension
+    platform: iOS
+    sources:
+      - path: PingPulseTunnel
+        excludes:
+          - "Resources/Info.plist"
+          - "Resources/PingPulseTunnel.entitlements"
+      - path: Shared
+    settings:
+      base:
+        PRODUCT_NAME: PingPulseTunnel
+        PRODUCT_BUNDLE_IDENTIFIER: com.nguyenbinhchanh.pingpulse.tunnel
+        INFOPLIST_FILE: PingPulseTunnel/Resources/Info.plist
+        CODE_SIGN_ENTITLEMENTS: PingPulseTunnel/Resources/PingPulseTunnel.entitlements
+        APPLICATION_EXTENSION_API_ONLY: YES
+        SKIP_INSTALL: YES
+        MARKETING_VERSION: "1.0.0"
+        CURRENT_PROJECT_VERSION: "1"
+    dependencies:
+      - sdk: NetworkExtension.framework
+      - sdk: Network.framework
+
+  PingPulseCoreTests:
+    type: bundle.unit-test
+    platform: iOS
+    sources:
+      - path: Tests/PingPulseCoreTests
+      - path: Shared
+      - path: PingPulseTunnel/Network
+      - path: PingPulseTunnel/Engine
+    settings:
+      base:
+        PRODUCT_NAME: PingPulseCoreTests
+        PRODUCT_BUNDLE_IDENTIFIER: com.nguyenbinhchanh.pingpulse.tests
+        GENERATE_INFOPLIST_FILE: YES
+    dependencies:
+      - sdk: Network.framework

@@ -1,0 +1,14 @@
+.DS_Store
+build/
+DerivedData/
+*.xcodeproj/
+!*.xcodeproj/project.pbxproj
+*.xcworkspace/
+xcuserdata/
+Payload/
+*.ipa
+*.mobileprovision
+*.p12
+.build/
+__pycache__/
+*.pyc

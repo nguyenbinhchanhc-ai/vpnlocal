@@ -1,0 +1,78 @@
+name: Build iOS PingPulseVPN IPA
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ main, master ]
+
+permissions:
+  contents: write
+
+jobs:
+  build-and-package:
+    runs-on: macos-14
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Show Xcode & Swift versions
+        run: |
+          xcodebuild -version
+          swift --version
+
+      - name: Install XcodeGen
+        run: brew install xcodegen
+
+      - name: Generate Xcode project
+        run: xcodegen generate --spec project.yml
+
+      - name: Run PingPulseCoreTests on iOS Simulator
+        run: |
+          SIM_ID=$(xcrun simctl list devices available | grep -E "iPhone (15|16)" | head -n 1 | grep -oE "[0-9A-F-]{36}")
+          echo "Using Simulator: $SIM_ID"
+          xcodebuild test \
+            -project PingPulseVPN.xcodeproj \
+            -scheme PingPulseCoreTests \
+            -destination "platform=iOS Simulator,id=$SIM_ID" \
+            CODE_SIGNING_ALLOWED=NO
+
+      - name: Build Release iOS App + Tunnel Extension (Unsigned)
+        run: |
+          xcodebuild build \
+            -project PingPulseVPN.xcodeproj \
+            -scheme PingPulseVPN \
+            -configuration Release \
+            -destination 'generic/platform=iOS' \
+            -derivedDataPath build \
+            CODE_SIGN_IDENTITY="" \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_ENTITLEMENTS="" \
+            CODE_SIGNING_ALLOWED=NO
+
+      - name: Verify App & Embedded Tunnel Extension and Package IPA
+        run: |
+          APP_PATH="build/Build/Products/Release-iphoneos/PingPulseVPN.app"
+          test -d "$APP_PATH"
+          test -d "$APP_PATH/PlugIns/PingPulseTunnel.appex"
+          mkdir -p Payload
+          cp -R "$APP_PATH" Payload/
+          zip -r -y PingPulseVPN.ipa Payload
+          rm -rf Payload
+          ls -lh PingPulseVPN.ipa
+
+      - name: Upload IPA Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: PingPulseVPN-IPA
+          path: PingPulseVPN.ipa
+          retention-days: 30
+
+      - name: Publish GitHub Release with IPA
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="v1.0.${{ github.run_number }}"
+          gh release create "$TAG" PingPulseVPN.ipa \
+            --title "PingPulse VPN $TAG" \
+            --notes "Automated unsigned iOS IPA build containing PingPulseVPN.app + PingPulseTunnel.appex (NEPacketTunnelProvider)." \
+            --latest || true
