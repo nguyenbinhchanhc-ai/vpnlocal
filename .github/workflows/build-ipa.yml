@@ -10,7 +10,7 @@ permissions:
 
 jobs:
   build-and-package:
-    runs-on: macos-14
+    runs-on: macos-latest
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -28,7 +28,7 @@ jobs:
 
       - name: Run PingPulseCoreTests on iOS Simulator
         run: |
-          SIM_ID=$(xcrun simctl list devices available | grep -E "iPhone (15|16)" | head -n 1 | grep -oE "[0-9A-F-]{36}")
+          SIM_ID=$(xcrun simctl list devices available | grep -E "iPhone [0-9]+" | head -n 1 | grep -oE "[0-9A-F-]{36}")
           echo "Using Simulator: $SIM_ID"
           xcodebuild test \
             -project PingPulseVPN.xcodeproj \
