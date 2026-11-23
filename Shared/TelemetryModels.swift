@@ -96,6 +96,10 @@ public struct TunnelStats: Codable, Equatable, Sendable {
     public var packetsScheduledP2: Int
     public var packetsScheduledP3: Int
     public var udpRelayedPackets: Int
+    public var rawPacketsRead: Int
+    public var ipv4PacketsRead: Int
+    public var ipv6PacketsRead: Int
+    public var dnsPacketsRead: Int
     public var averageLocalResolutionMs: Double
     public var activeMTU: Int
     public var networkPathDescription: String
@@ -113,6 +117,10 @@ public struct TunnelStats: Codable, Equatable, Sendable {
         packetsScheduledP2: Int = 0,
         packetsScheduledP3: Int = 0,
         udpRelayedPackets: Int = 0,
+        rawPacketsRead: Int = 0,
+        ipv4PacketsRead: Int = 0,
+        ipv6PacketsRead: Int = 0,
+        dnsPacketsRead: Int = 0,
         averageLocalResolutionMs: Double = 0,
         activeMTU: Int = 1420,
         networkPathDescription: String = "Idle",
@@ -129,6 +137,10 @@ public struct TunnelStats: Codable, Equatable, Sendable {
         self.packetsScheduledP2 = packetsScheduledP2
         self.packetsScheduledP3 = packetsScheduledP3
         self.udpRelayedPackets = udpRelayedPackets
+        self.rawPacketsRead = rawPacketsRead
+        self.ipv4PacketsRead = ipv4PacketsRead
+        self.ipv6PacketsRead = ipv6PacketsRead
+        self.dnsPacketsRead = dnsPacketsRead
         self.averageLocalResolutionMs = averageLocalResolutionMs
         self.activeMTU = activeMTU
         self.networkPathDescription = networkPathDescription

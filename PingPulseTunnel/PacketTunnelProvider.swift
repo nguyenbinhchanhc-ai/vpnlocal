@@ -202,10 +202,11 @@ public final class PacketTunnelProvider: NEPacketTunnelProvider {
         mtu: Int,
         completion: @escaping (Error?) -> Void
     ) {
+        // Use distinct remote peer (.1), local TUN IP (.2), and virtual DNS IPs (.3 / .4)
+        // so iOS never confuses tunnelRemoteAddress with the local DNS sink.
         let settings = NEPacketTunnelNetworkSettings(tunnelRemoteAddress: AppGroupConstants.tunnelGatewayAddress)
         settings.mtu = NSNumber(value: max(1280, min(1500, mtu)))
 
-        // IPv4 virtual interface + split-tunnel routes for local DNS (10.11.0.1) and optional UDP CIDRs
         let ipv4 = NEIPv4Settings(
             addresses: [AppGroupConstants.tunnelVirtualAddress],
             subnetMasks: [AppGroupConstants.tunnelSubnetMask]
@@ -213,7 +214,7 @@ public final class PacketTunnelProvider: NEPacketTunnelProvider {
 
         var includedIPv4: [NEIPv4Route] = [
             NEIPv4Route(destinationAddress: AppGroupConstants.tunnelDNSServer, subnetMask: "255.255.255.255"),
-            NEIPv4Route(destinationAddress: "10.11.0.0", subnetMask: "255.255.255.0")
+            NEIPv4Route(destinationAddress: AppGroupConstants.tunnelSecondaryDNSServer, subnetMask: "255.255.255.255")
         ]
         if config.enableUDPRelayRoutes {
             for rule in config.customRoutes where rule.isEnabled {
@@ -225,19 +226,9 @@ public final class PacketTunnelProvider: NEPacketTunnelProvider {
         ipv4.includedRoutes = includedIPv4
         settings.ipv4Settings = ipv4
 
-        // IPv6 virtual interface so dual-stack iOS mDNSResponder queries hitting fd11:0:0:1::1 are also captured
-        let ipv6 = NEIPv6Settings(
-            addresses: [AppGroupConstants.tunnelVirtualIPv6Address],
-            networkPrefixLengths: [64]
-        )
-        ipv6.includedRoutes = [
-            NEIPv6Route(destinationAddress: AppGroupConstants.tunnelDNSIPv6Server, networkPrefixLength: 128)
-        ]
-        settings.ipv6Settings = ipv6
-
         let dnsSettings = NEDNSSettings(servers: [
             AppGroupConstants.tunnelDNSServer,
-            AppGroupConstants.tunnelDNSIPv6Server
+            AppGroupConstants.tunnelSecondaryDNSServer
         ])
         dnsSettings.matchDomains = [""]
         settings.dnsSettings = dnsSettings
@@ -253,30 +244,44 @@ public final class PacketTunnelProvider: NEPacketTunnelProvider {
 
             self.engineQueue.async {
                 self.processIncomingBatch(packets: packets, protocols: protocols)
-                self.readPacketsLoop()
             }
+            self.readPacketsLoop()
         }
     }
 
     private func processIncomingBatch(packets: [Data], protocols: [NSNumber]) {
         var parsedIPv4: [IPv4Packet] = []
         parsedIPv4.reserveCapacity(packets.count)
+        var v4Count = 0
+        var v6Count = 0
 
         for (index, raw) in packets.enumerated() {
             let protoFamily = index < protocols.count ? protocols[index].int32Value : AF_INET
             if protoFamily == AF_INET6 {
+                v6Count += 1
                 if let ipv6UDP = IPv6UDPPacket(data: raw), ipv6UDP.destinationPort == 53 {
                     stateLock.lock()
                     stats.packetsScheduledP0 += 1
+                    stats.dnsPacketsRead += 1
                     stateLock.unlock()
                     handleIPv6DNSQuery(packet: ipv6UDP, config: currentConfig())
                 }
                 continue
             }
-            if protoFamily == AF_INET, let ipv4 = IPv4Packet(data: raw) {
-                parsedIPv4.append(ipv4)
+            if protoFamily == AF_INET {
+                v4Count += 1
+                if let ipv4 = IPv4Packet(data: raw) {
+                    parsedIPv4.append(ipv4)
+                }
             }
         }
+
+        stateLock.lock()
+        stats.rawPacketsRead += packets.count
+        stats.ipv4PacketsRead += v4Count
+        stats.ipv6PacketsRead += v6Count
+        stats.updatedAt = Date()
+        stateLock.unlock()
 
         guard !parsedIPv4.isEmpty else { return }
 
@@ -310,6 +315,9 @@ public final class PacketTunnelProvider: NEPacketTunnelProvider {
         guard let udp = packet.udpSegment else { return }
 
         if udp.destinationPort == 53 {
+            stateLock.lock()
+            stats.dnsPacketsRead += 1
+            stateLock.unlock()
             handleDNSPayload(udp.payload, config: config) { [weak self] replyData in
                 guard let self else { return }
                 let ipReply = IPv4Packet.buildUDPReply(

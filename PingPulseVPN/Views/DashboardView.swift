@@ -93,6 +93,12 @@ struct DashboardView: View {
             .font(.caption)
             .foregroundColor(.secondary)
 
+            Text(vpnManager.ipcDiagnostic)
+                .font(.caption2.monospaced())
+                .foregroundColor(vpnManager.ipcDiagnostic.hasPrefix("IPC OK") ? accentEmerald : .yellow)
+                .lineLimit(1)
+                .truncationMode(.middle)
+
             if let errorMessage = vpnManager.lastErrorMessage {
                 Text(errorMessage)
                     .font(.caption)

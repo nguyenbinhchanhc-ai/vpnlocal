@@ -10,6 +10,7 @@ public final class VPNManager: ObservableObject {
     @Published public private(set) var stats: TunnelStats
     @Published public private(set) var queryLogs: [QueryLogEntry] = []
     @Published public private(set) var resolverMetrics: [ResolverHealthMetric] = []
+    @Published public private(set) var ipcDiagnostic: String = "IPC: Standby"
     @Published public var lastErrorMessage: String?
 
     private let store = SharedStore.shared
@@ -101,17 +102,19 @@ public final class VPNManager: ObservableObject {
         }
     }
 
-    /// Triggers a live HTTPS/DNS lookup through iOS networking to immediately exercise
+    /// Triggers a live uncached DNS lookup through iOS networking to immediately exercise
     /// the local tunnel DNS optimizer and verify query capture.
     public func runDNSTestQuery() {
         lastErrorMessage = nil
-        let conn = NWConnection(host: "one.one.one.one", port: .https, using: .tcp)
+        let nonce = Int(Date().timeIntervalSince1970 * 100) % 100000
+        let testHost = "probe-\(nonce).example.com"
+        let conn = NWConnection(host: NWEndpoint.Host(testHost), port: .https, using: .tcp)
         conn.stateUpdateHandler = { [weak self] state in
             switch state {
             case .ready, .failed, .cancelled:
                 conn.cancel()
                 Task { @MainActor [weak self] in
-                    try? await Task.sleep(nanoseconds: 350_000_000)
+                    try? await Task.sleep(nanoseconds: 400_000_000)
                     self?.refreshFromStore()
                 }
             default:
@@ -192,7 +195,7 @@ public final class VPNManager: ObservableObject {
     private func configureProtocol(on mgr: NETunnelProviderManager, allowOnDemand: Bool) {
         let proto = NETunnelProviderProtocol()
         proto.providerBundleIdentifier = AppGroupConstants.resolvedTunnelBundleIdentifier
-        proto.serverAddress = "PingPulse Local Engine (10.11.0.1)"
+        proto.serverAddress = "PingPulse Local Engine (198.18.0.3)"
         mgr.protocolConfiguration = proto
         mgr.localizedDescription = "PingPulse Local Anti-Ping VPN"
         mgr.isEnabled = true
@@ -234,6 +237,7 @@ public final class VPNManager: ObservableObject {
     private func sendIPCEnvelope(_ envelope: IPCEnvelope) {
         guard let session = manager?.connection as? NETunnelProviderSession,
               status == .connected || status == .reasserting else {
+            ipcDiagnostic = "IPC: Disconnected (\(AppGroupConstants.resolvedTunnelBundleIdentifier))"
             return
         }
         guard let payload = try? JSONEncoder().encode(envelope) else { return }
@@ -243,7 +247,7 @@ public final class VPNManager: ObservableObject {
                 Task { @MainActor in
                     guard let responseData else {
                         if envelope.command == .getFullTelemetry {
-                            // Fall back to App Group store if provider returned nil
+                            self.ipcDiagnostic = "IPC: Nil reply from \(AppGroupConstants.resolvedTunnelBundleIdentifier)"
                             self.stats = self.store.loadStats()
                             self.queryLogs = self.store.loadQueryLogs()
                             self.resolverMetrics = self.store.loadResolverMetrics()
@@ -256,13 +260,16 @@ public final class VPNManager: ObservableObject {
                         self.stats = snapshot.stats
                         self.queryLogs = snapshot.logs
                         self.resolverMetrics = snapshot.resolverMetrics
+                        self.ipcDiagnostic = "IPC OK • RX \(snapshot.stats.rawPacketsRead) pkts • DNS \(snapshot.stats.dnsPacketsRead)"
                     } else if envelope.command == .getLiveStats,
                               let decoded = try? JSONDecoder().decode(TunnelStats.self, from: responseData) {
                         self.stats = decoded
+                        self.ipcDiagnostic = "IPC OK • RX \(decoded.rawPacketsRead) pkts • DNS \(decoded.dnsPacketsRead)"
                     }
                 }
             }
         } catch {
+            self.ipcDiagnostic = "IPC Error: \(error.localizedDescription)"
             self.lastErrorMessage = "Extension IPC error: \(error.localizedDescription)"
         }
     }
