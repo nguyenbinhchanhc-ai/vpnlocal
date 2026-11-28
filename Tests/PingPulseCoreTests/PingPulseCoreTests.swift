@@ -203,6 +203,37 @@ final class PingPulseCoreTests: XCTestCase {
         XCTAssertEqual(snapDecoded.logs.count, 1)
     }
 
+    func testSocks5UDPFrameParseAndBuild() {
+        // RSV(2) + FRAG(1) + ATYP=1(IPv4) + 198.18.0.3 + port 53 + payload
+        var frameData = Data([0x00, 0x00, 0x00, 0x01, 198, 18, 0, 3, 0x00, 53])
+        let query = makeDNSQuery(txID: 0x4242, domain: "pingpulse.dev", qtype: 1)
+        frameData.append(query)
+
+        let parsed = Socks5Codec.parseUDPFrame(frameData)
+        XCTAssertNotNil(parsed)
+        XCTAssertEqual(parsed?.host, "198.18.0.3")
+        XCTAssertEqual(parsed?.port, 53)
+        XCTAssertEqual(parsed?.payload, query)
+
+        let rebuilt = Socks5Codec.buildUDPFrame(headerPrefix: parsed!.headerPrefix, payload: query)
+        XCTAssertEqual(rebuilt, frameData)
+    }
+
+    func testDNSEngineBlocksNoiseLocally() {
+        let engine = DNSEngine()
+        engine.updateConfig(.defaultConfig)
+        let query = makeDNSQuery(txID: 0x9999, domain: "app-measurement.com", qtype: 1)
+
+        let exp = expectation(description: "DNSEngine blocks telemetry")
+        engine.processQuery(payload: query, config: .defaultConfig) { result in
+            XCTAssertNotNil(result)
+            XCTAssertEqual(result?.logEntry.outcome, .blockedNoise)
+            XCTAssertEqual((result?.responseData[3] ?? 0) & 0x0F, 3)
+            exp.fulfill()
+        }
+        waitForExpectations(timeout: 2.0)
+    }
+
     private func makeDNSQuery(txID: UInt16, domain: String, qtype: UInt16) -> Data {
         var data = Data()
         data.append(UInt8((txID >> 8) & 0xFF))

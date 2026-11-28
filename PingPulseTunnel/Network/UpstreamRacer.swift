@@ -8,24 +8,16 @@ public struct UpstreamResolution: Sendable {
     public let wasHedgedWin: Bool
 }
 
-/// EWMA-scored DNS upstream racer supporting both low-latency UDP/53 (with QoS serviceClass)
-/// and RFC 8484 binary DoH, with hedged parallel failover to eliminate tail-latency spikes.
+/// EWMA-scored DNS upstream racer supporting both low-latency UDP/53 and DoH (over TLS NWConnection).
+/// Every outbound NWConnection explicitly prohibits `.other` (utun) interfaces so full-tunnel mode
+/// never causes routing loops.
 public final class UpstreamRacer: @unchecked Sendable {
     private let lock = NSLock()
     private var resolvers: [UpstreamResolver] = []
     private var metrics: [String: ResolverHealthMetric] = [:]
     private let queue = DispatchQueue(label: "com.nguyenbinhchanh.pingpulse.racer", qos: .userInteractive, attributes: .concurrent)
-    private let urlSession: URLSession
 
-    public init() {
-        let sessionConfig = URLSessionConfiguration.ephemeral
-        sessionConfig.timeoutIntervalForRequest = 2.0
-        sessionConfig.timeoutIntervalForResource = 2.5
-        sessionConfig.networkServiceType = .responsiveData
-        sessionConfig.httpMaximumConnectionsPerHost = 4
-        sessionConfig.waitsForConnectivity = false
-        self.urlSession = URLSession(configuration: sessionConfig)
-    }
+    public init() {}
 
     public func updateResolvers(_ list: [UpstreamResolver]) {
         lock.lock()
@@ -192,7 +184,7 @@ public final class UpstreamRacer: @unchecked Sendable {
         case .udp:
             sendUDPQuery(queryData: queryData, host: resolver.address, port: resolver.port, completion: completion)
         case .doh:
-            sendDoHQuery(queryData: queryData, urlString: resolver.endpoint, completion: completion)
+            sendDoHQuery(queryData: queryData, resolver: resolver, completion: completion)
         }
     }
 
@@ -209,6 +201,8 @@ public final class UpstreamRacer: @unchecked Sendable {
 
         let params = NWParameters.udp
         params.serviceClass = .interactiveVoice
+        params.prohibitedInterfaceTypes = [.other]
+        params.preferNoProxies = true
         let connection = NWConnection(host: NWEndpoint.Host(host), port: nwPort, using: params)
 
         let onceFlag = OnceFlag()
@@ -219,7 +213,7 @@ public final class UpstreamRacer: @unchecked Sendable {
             completion(data)
         }
 
-        queue.asyncAfter(deadline: .now() + .milliseconds(1400)) {
+        queue.asyncAfter(deadline: .now() + .milliseconds(1500)) {
             finish(nil)
         }
 
@@ -248,35 +242,120 @@ public final class UpstreamRacer: @unchecked Sendable {
         connection.start(queue: queue)
     }
 
+    private final class ResponseBuffer: @unchecked Sendable {
+        private let lock = NSLock()
+        private var data = Data()
+
+        func append(_ chunk: Data) -> Data {
+            lock.lock()
+            defer { lock.unlock() }
+            data.append(chunk)
+            return data
+        }
+
+        func snapshot() -> Data {
+            lock.lock()
+            defer { lock.unlock() }
+            return data
+        }
+    }
+
     private func sendDoHQuery(
         queryData: Data,
-        urlString: String,
+        resolver: UpstreamResolver,
         completion: @escaping @Sendable (Data?) -> Void
     ) {
-        guard let url = URL(string: urlString) else {
+        guard let url = URL(string: resolver.endpoint),
+              let host = url.host else {
             completion(nil)
             return
         }
+        let path = url.path.isEmpty ? "/dns-query" : url.path
+        let port = NWEndpoint.Port(rawValue: UInt16(url.port ?? 443)) ?? .https
 
-        var request = URLRequest(url: url)
-        request.httpMethod = "POST"
-        request.httpBody = queryData
-        request.setValue("application/dns-message", forHTTPHeaderField: "Content-Type")
-        request.setValue("application/dns-message", forHTTPHeaderField: "Accept")
-        request.networkServiceType = .responsiveData
-        request.timeoutInterval = 1.8
+        let params = NWParameters.tls
+        params.serviceClass = .responsiveData
+        params.prohibitedInterfaceTypes = [.other]
+        params.preferNoProxies = true
 
-        let task = urlSession.dataTask(with: request) { data, response, error in
-            guard error == nil,
-                  let http = response as? HTTPURLResponse,
-                  (200...299).contains(http.statusCode),
-                  let data,
-                  data.count >= 12 else {
-                completion(nil)
-                return
-            }
+        let targetHost = resolver.address.isEmpty ? host : resolver.address
+        let connection = NWConnection(host: NWEndpoint.Host(targetHost), port: port, using: params)
+
+        let onceFlag = OnceFlag()
+        let buffer = ResponseBuffer()
+
+        @Sendable func finish(_ data: Data?) {
+            guard onceFlag.claim() else { return }
+            connection.cancel()
             completion(data)
         }
-        task.resume()
+
+        queue.asyncAfter(deadline: .now() + .milliseconds(1800)) {
+            finish(nil)
+        }
+
+        @Sendable func readMore() {
+            connection.receive(minimumIncompleteLength: 1, maximumLength: 8192) { chunk, _, isComplete, err in
+                if let chunk, !chunk.isEmpty {
+                    let current = buffer.append(chunk)
+                    if let parsedBody = Self.extractHTTPBodyIfComplete(from: current) {
+                        finish(parsedBody)
+                        return
+                    }
+                }
+                if isComplete || err != nil {
+                    finish(Self.extractHTTPBodyIfComplete(from: buffer.snapshot(), allowEOF: true))
+                } else {
+                    readMore()
+                }
+            }
+        }
+
+        connection.stateUpdateHandler = { state in
+            switch state {
+            case .ready:
+                let header = "POST \(path) HTTP/1.1\r\nHost: \(host)\r\nContent-Type: application/dns-message\r\nAccept: application/dns-message\r\nContent-Length: \(queryData.count)\r\nConnection: close\r\n\r\n"
+                var httpReq = Data(header.utf8)
+                httpReq.append(queryData)
+                connection.send(content: httpReq, completion: .contentProcessed { sendErr in
+                    if sendErr != nil {
+                        finish(nil)
+                        return
+                    }
+                    readMore()
+                })
+            case .failed, .cancelled:
+                finish(nil)
+            default:
+                break
+            }
+        }
+        connection.start(queue: queue)
+    }
+
+    public static func extractHTTPBodyIfComplete(from data: Data, allowEOF: Bool = false) -> Data? {
+        let separator = Data([0x0D, 0x0A, 0x0D, 0x0A]) // \r\n\r\n
+        guard let sepRange = data.range(of: separator) else { return nil }
+        let headerData = data.subdata(in: data.startIndex..<sepRange.lowerBound)
+        guard let headerStr = String(data: headerData, encoding: .utf8) else { return nil }
+
+        let lines = headerStr.split(separator: "\r\n", omittingEmptySubsequences: false)
+        guard let statusLine = lines.first, statusLine.contains(" 200 ") else {
+            return allowEOF ? nil : nil
+        }
+
+        let bodyStart = sepRange.upperBound
+        let body = data.subdata(in: bodyStart..<data.endIndex)
+
+        for line in lines {
+            let lower = line.lowercased()
+            if lower.hasPrefix("content-length:"),
+               let lenStr = lower.split(separator: ":").dropFirst().first,
+               let expectedLen = Int(lenStr.trimmingCharacters(in: .whitespaces)) {
+                return body.count >= expectedLen ? body.prefix(expectedLen) : nil
+            }
+        }
+
+        return allowEOF && body.count >= 12 ? body : nil
     }
 }
