@@ -10,5 +10,6 @@ Payload/
 *.mobileprovision
 *.p12
 .build/
+Vendor/
 __pycache__/
 *.pyc

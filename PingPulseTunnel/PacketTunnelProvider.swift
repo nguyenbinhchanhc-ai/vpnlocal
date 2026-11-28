@@ -1,7 +1,6 @@
 import Foundation
 import Network
 import NetworkExtension
-import Tun2SocksKit
 
 public final class PacketTunnelProvider: NEPacketTunnelProvider {
     private let store = SharedStore.shared
@@ -77,7 +76,7 @@ public final class PacketTunnelProvider: NEPacketTunnelProvider {
         isRunning = false
         stateLock.unlock()
 
-        Socks5Tunnel.quit()
+        HevTunnelBridge.quit()
         orchestrator?.stop()
         orchestrator = nil
 
@@ -226,7 +225,7 @@ public final class PacketTunnelProvider: NEPacketTunnelProvider {
             guard let self else { return }
             for attempt in 0..<8 {
                 if !self.tunnelRunning() { return }
-                let code = Socks5Tunnel.run(withConfig: .string(content: yamlConfig))
+                let code = HevTunnelBridge.run(configString: yamlConfig)
                 if code == 0 || !self.tunnelRunning() {
                     break
                 }
@@ -306,8 +305,8 @@ public final class PacketTunnelProvider: NEPacketTunnelProvider {
     }
 
     private func syncSocks5Stats() {
-        let tunStats = Socks5Tunnel.stats
-        let totalTunPackets = tunStats.up.packets + tunStats.down.packets
+        let tunStats = HevTunnelBridge.stats
+        let totalTunPackets = tunStats.upPackets + tunStats.downPackets
         stateLock.lock()
         if totalTunPackets > 0 {
             stats.rawPacketsRead = totalTunPackets

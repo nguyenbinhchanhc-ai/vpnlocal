@@ -34,6 +34,8 @@ def check_required_files():
         "Shared/TelemetryModels.swift",
         "Shared/SharedStore.swift",
         "PingPulseTunnel/PacketTunnelProvider.swift",
+        "PingPulseTunnel/HevTunnelBridge.swift",
+        "PingPulseTunnel/Bridge/PingPulseTunnel-Bridging-Header.h",
         "PingPulseTunnel/Network/IPv4Packet.swift",
         "PingPulseTunnel/Network/IPv6DNSPacket.swift",
         "PingPulseTunnel/Network/LocalSocks5Orchestrator.swift",
