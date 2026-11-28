@@ -10,7 +10,7 @@ options:
 packages:
   Tun2SocksKit:
     url: https://github.com/EbrahimTahernejad/Tun2SocksKit.git
-    from: 5.20.0
+    from: "5.20.0"
 
 settings:
   base:
@@ -93,6 +93,7 @@ targets:
         CURRENT_PROJECT_VERSION: "5"
     dependencies:
       - package: Tun2SocksKit
+        product: Tun2SocksKit
       - sdk: NetworkExtension.framework
       - sdk: Network.framework
 
